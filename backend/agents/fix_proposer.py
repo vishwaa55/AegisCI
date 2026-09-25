@@ -143,10 +143,13 @@ def fix_proposer_agent(state: AegisAgentState) -> AegisAgentState:
         "5. Ensure line numbers, context lines, and indentation are precise."
     )
 
+    cleaned_logs = state.get("cleaned_logs", "")
+
     user_prompt = (
         f"Incident ID: {incident_id}\n"
         f"Diagnosis Category: {category}\n"
         f"Diagnosis Evidence:\n{evidence}\n\n"
+        f"CI Failure Logs & Traceback:\n```\n{cleaned_logs}\n```\n\n"
         f"Affected File(s) Contents:\n{files_context}\n"
         f"{attempt_feedback}\n"
         "Generate the unified diff patch to resolve the failure:"

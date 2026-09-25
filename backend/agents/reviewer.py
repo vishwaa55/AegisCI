@@ -18,7 +18,7 @@ logger = logging.getLogger("aegis.reviewer")
 
 def apply_patch_to_directory(repo_dir: str, patch_diff: str) -> Tuple[bool, str]:
     """
-    Applies unified diff patch to a target directory using git apply or fallback.
+    Applies unified diff patch to a target directory using git apply or smart fallback parser.
     """
     if not patch_diff or not patch_diff.strip():
         return False, "Patch diff is empty"
@@ -28,22 +28,21 @@ def apply_patch_to_directory(repo_dir: str, patch_diff: str) -> Tuple[bool, str]
         with open(patch_file_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(patch_diff + "\n")
 
-        # Try git apply
+        # First attempt: git apply with whitespace tolerance
         cmd = ["git", "apply", "--ignore-space-change", "--ignore-whitespace", "--unidiff-zero", ".aegis_temp.patch"]
         res = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
         if res.returncode == 0:
             return True, "Patch applied cleanly via git apply"
 
-        # Try with -p0 or 3-way
         cmd_p0 = ["git", "apply", "-p0", "--ignore-space-change", "--ignore-whitespace", ".aegis_temp.patch"]
         res_p0 = subprocess.run(cmd_p0, cwd=repo_dir, capture_output=True, text=True)
         if res_p0.returncode == 0:
             return True, "Patch applied cleanly via git apply -p0"
 
-        # If git apply fails, try fallback direct file patch
-        fallback_ok, fallback_msg = apply_unified_diff_fallback(repo_dir, patch_diff)
+        # Fallback: Robust smart hunk matcher
+        fallback_ok, fallback_msg = apply_unified_diff_smart(repo_dir, patch_diff)
         if fallback_ok:
-            return True, f"Patch applied via fallback: {fallback_msg}"
+            return True, f"Patch applied via smart fallback: {fallback_msg}"
 
         return False, f"git apply failed: {res.stderr}\nFallback: {fallback_msg}"
     finally:
@@ -54,71 +53,104 @@ def apply_patch_to_directory(repo_dir: str, patch_diff: str) -> Tuple[bool, str]
                 pass
 
 
-def apply_unified_diff_fallback(repo_dir: str, patch_diff: str) -> Tuple[bool, str]:
+def apply_unified_diff_smart(repo_dir: str, patch_diff: str) -> Tuple[bool, str]:
     """
-    Fallback unified diff patcher for simple edits when git apply fails due to whitespace.
-    Parses @@ -start,len +start,len @@ headers and replaces target lines.
+    Robust smart unified diff applicator. Parses file hunks and applies substitutions
+    even when line numbers or line endings vary.
     """
     try:
         lines = patch_diff.splitlines()
-        target_file = None
-        hunks = []
-        current_hunk = None
+        current_file = None
+        file_hunks: Dict[str, List[List[str]]] = {}
+        current_hunk: List[str] = []
 
         for line in lines:
             if line.startswith("--- a/") or line.startswith("--- "):
-                path = line.split(" ", 1)[1].strip()
-                if path.startswith("a/"):
-                    path = path[2:]
-                target_file = os.path.join(repo_dir, path)
+                if current_file and current_hunk:
+                    file_hunks.setdefault(current_file, []).append(current_hunk)
+                    current_hunk = []
+                p = line.split(" ", 1)[1].strip()
+                if p.startswith("a/"):
+                    p = p[2:]
+                current_file = p
+            elif line.startswith("+++ "):
+                continue
             elif line.startswith("@@"):
-                if current_hunk:
-                    hunks.append(current_hunk)
-                current_hunk = {"header": line, "removals": [], "additions": [], "context": []}
-            elif current_hunk is not None:
-                if line.startswith("-") and not line.startswith("---"):
-                    current_hunk["removals"].append(line[1:])
-                elif line.startswith("+") and not line.startswith("+++"):
-                    current_hunk["additions"].append(line[1:])
-                elif line.startswith(" "):
-                    current_hunk["context"].append(line[1:])
+                if current_file and current_hunk:
+                    file_hunks.setdefault(current_file, []).append(current_hunk)
+                current_hunk = []
+            elif current_file and (line.startswith(" ") or line.startswith("+") or line.startswith("-")):
+                current_hunk.append(line)
 
-        if current_hunk:
-            hunks.append(current_hunk)
+        if current_file and current_hunk:
+            file_hunks.setdefault(current_file, []).append(current_hunk)
 
-        if not target_file or not os.path.exists(target_file):
-            return False, f"Target file not found for fallback patch: {target_file}"
+        if not file_hunks:
+            return False, "No valid hunks found in patch diff"
 
-        with open(target_file, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # Apply hunk replacements
-        for h in hunks:
-            removals_block = "\n".join(h["removals"])
-            additions_block = "\n".join(h["additions"])
-            if removals_block in content:
-                content = content.replace(removals_block, additions_block, 1)
-            elif len(h["removals"]) == 1 and h["removals"][0].strip() in content:
-                # single line fuzzy match
-                old_line = h["removals"][0].strip()
-                new_line = additions_block.strip()
-                lines_in_file = content.splitlines()
-                replaced = False
-                for idx, fl in enumerate(lines_in_file):
-                    if fl.strip() == old_line:
-                        indent = len(fl) - len(fl.lstrip())
-                        lines_in_file[idx] = (" " * indent) + new_line
-                        replaced = True
+        applied_files = 0
+        for rel_path, hunks in file_hunks.items():
+            full_path = os.path.join(repo_dir, rel_path)
+            if not os.path.isfile(full_path):
+                # Try finding file under repo_dir
+                basename = os.path.basename(rel_path)
+                found = None
+                for root, _, files in os.walk(repo_dir):
+                    if basename in files:
+                        found = os.path.join(root, basename)
                         break
-                if replaced:
-                    content = "\n".join(lines_in_file)
+                if found:
+                    full_path = found
+                else:
+                    return False, f"Target file not found: {rel_path}"
 
-        with open(target_file, "w", encoding="utf-8") as f:
-            f.write(content)
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
 
-        return True, "Fallback patch applied successfully"
+            for hunk in hunks:
+                content = _replace_hunk_in_content(content, hunk)
+
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            applied_files += 1
+
+        return True, f"Successfully applied changes to {applied_files} file(s)"
     except Exception as e:
-        return False, f"Fallback patch exception: {e}"
+        return False, f"Smart patch error: {e}"
+
+
+def _replace_hunk_in_content(content: str, hunk_lines: List[str]) -> str:
+    """Replaces a single diff hunk inside file content with fallback fuzzy matching."""
+    orig_chunk = []
+    mod_chunk = []
+    for line in hunk_lines:
+        prefix = line[0]
+        text = line[1:]
+        if prefix in (" ", "-"):
+            orig_chunk.append(text)
+        if prefix in (" ", "+"):
+            mod_chunk.append(text)
+
+    orig_str = "\n".join(orig_chunk)
+    mod_str = "\n".join(mod_chunk)
+
+    if orig_str and orig_str in content:
+        return content.replace(orig_str, mod_str, 1)
+
+    # Fuzzy line matching: ignore whitespace variation
+    content_lines = content.splitlines()
+    clean_orig = [l.strip() for l in orig_chunk if l.strip()]
+    if not clean_orig:
+        return content
+
+    for i in range(len(content_lines) - len(clean_orig) + 1):
+        window = [content_lines[i + j].strip() for j in range(len(clean_orig))]
+        if window == clean_orig:
+            # Match found
+            res_lines = content_lines[:i] + mod_chunk + content_lines[i + len(clean_orig):]
+            return "\n".join(res_lines)
+
+    return content
 
 
 def run_isolated_tests(sandbox_dir: str) -> Tuple[bool, str]:
@@ -331,6 +363,9 @@ def reviewer_agent(state: AegisAgentState) -> AegisAgentState:
         _update_incident_db(
             incident_id=incident_id,
             category=category,
+            confidence=state.get("diagnosis_confidence", 0.0),
+            affected_files=state.get("affected_files", []),
+            evidence=evidence,
             attempts=current_attempt,
             outcome=final_outcome,
             pr_link=pr_url,
@@ -374,6 +409,9 @@ def reviewer_agent(state: AegisAgentState) -> AegisAgentState:
         _update_incident_db(
             incident_id=incident_id,
             category=category,
+            confidence=state.get("diagnosis_confidence", 0.0),
+            affected_files=state.get("affected_files", []),
+            evidence=evidence,
             attempts=current_attempt,
             outcome=final_outcome,
             pr_link=None,
@@ -396,6 +434,9 @@ def reviewer_agent(state: AegisAgentState) -> AegisAgentState:
 def _update_incident_db(
     incident_id: str,
     category: str,
+    confidence: float,
+    affected_files: List[str],
+    evidence: str,
     attempts: int,
     outcome: str,
     pr_link: Optional[str],
@@ -409,6 +450,9 @@ def _update_incident_db(
         incident = db.query(Incident).filter(Incident.id == incident_id).first()
         if incident:
             incident.diagnosis_category = category
+            incident.diagnosis_confidence = confidence
+            incident.affected_files = affected_files
+            incident.evidence = evidence
             incident.attempts_made = attempts
             incident.final_outcome = outcome
             incident.pr_link = pr_link
