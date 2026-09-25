@@ -1,0 +1,31 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Environment secrets
+.env
+.env.local
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Agent temporary execution / isolated sandboxes
+.agent_sandbox/
+temp_work/
+
+# System / IDE generated files
+.system_generated/
+.idea/
+.vscode/
