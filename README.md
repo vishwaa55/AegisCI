@@ -98,6 +98,7 @@ GROQ_MODEL=qwen/qwen3.8-27b
 
 # AegisCI Configuration
 AEGIS_BACKEND_URL=http://localhost:8000
+AEGIS_WEBHOOK_SECRET=your_optional_webhook_secret_here
 DATABASE_URL=sqlite:///./aegis.db
 CHROMA_PERSIST_DIR=./chroma_data
 LOG_LEVEL=INFO
@@ -106,6 +107,62 @@ LOG_LEVEL=INFO
 GITHUB_TOKEN=your_github_token_here
 GITHUB_REPOSITORY=owner/repository_name
 ```
+
+---
+
+## Phase 3 — CI/CD Integration & Controlled Experimentation
+
+### 1. Unified CI Results Webhook
+The backend provides a unified intake endpoint:
+- `POST /ci/results`: Securely receives test exit codes, failure logs, and Semgrep findings.
+  - Authenticated via `X-Aegis-Secret` header when `AEGIS_WEBHOOK_SECRET` is set.
+  - Automatically sanitizes raw logs using `scrub_secrets()` to ensure no tokens or keys are ever logged or sent to LLMs.
+  - Enforces idempotency via `run_id` + `commit_sha` to prevent duplicate LLM agent invocations.
+
+### 2. Local CI Artifact Ingestion CLI
+When running AegisCI locally behind NAT and GitHub Actions runners cannot reach `localhost:8000`:
+1. GitHub Actions automatically uploads `aegis-ci-artifacts.zip` containing `aegis-ci-run.json`, `test-output.log`, and `semgrep-results.json`.
+2. Ingest the artifact locally using the CLI:
+   ```powershell
+   # Ingest from downloaded artifact zip
+   python -m backend.ingest_ci_artifact --zip path/to/aegis-ci-artifacts.zip
+
+   # Or ingest directly in-process without running the HTTP server
+   python -m backend.ingest_ci_artifact --file aegis-ci-run.json --direct
+   ```
+
+### 3. Functional Experiment Harness
+Isolated under `experiments/functional_fixtures/` with 4 reproducible failure modes:
+```powershell
+# Reset all fixture services to clean passing baseline
+python -m experiments.functional_fixtures.reset_fixtures --reset --test
+
+# Inject Failure Mode 1: Missing null check (AttributeError)
+python -m experiments.functional_fixtures.reset_fixtures --scenario null_check --test
+
+# Inject Failure Mode 2: Inverted logic / discount operator
+python -m experiments.functional_fixtures.reset_fixtures --scenario logic_bug --test
+
+# Inject Failure Mode 3: Syntax error
+python -m experiments.functional_fixtures.reset_fixtures --scenario syntax_error --test
+
+# Inject Failure Mode 4: Missing unresolvable dependency
+python -m experiments.functional_fixtures.reset_fixtures --scenario missing_dep --test
+```
+
+### 4. OWASP Juice Shop Security Target
+- Start local Juice Shop container (bound strictly to `127.0.0.1:3000`):
+  ```powershell
+  docker run -d --name aegis-juice-shop -p 127.0.0.1:3000:3000 --rm bkimminich/juice-shop:v17.1.1
+  ```
+- Stop local Juice Shop container:
+  ```powershell
+  docker stop aegis-juice-shop
+  ```
+- Run the Multi-Agent Security Debate against baseline Semgrep findings:
+  ```powershell
+  python -m experiments.juice_shop.run_security_experiment
+  ```
 
 ---
 
@@ -122,8 +179,9 @@ Interactive API documentation is available at: `http://localhost:8000/docs`
 ### Key Endpoints
 
 - `GET /health` — System status and version health check
-- `POST /incident` — Receive CI/CD functional failure logs and launch the 4-agent repair graph
-- `POST /security-incident` — Receive Semgrep JSON findings and launch the security debate graph
+- `POST /ci/results` — Phase 3 unified CI result webhook (handles both test failures & Semgrep findings)
+- `POST /incident` — Receive CI/CD functional failure logs directly
+- `POST /security-incident` — Receive Semgrep JSON findings directly
 - `GET /incidents` — List all registered incident records and their outcomes
 - `GET /incidents/{incident_id}` — Inspect detailed incident log, patch diff, and validation notes
 - `POST /known-failures` — Add known flaky test signatures to bypass false alarms
@@ -135,9 +193,13 @@ Interactive API documentation is available at: `http://localhost:8000/docs`
 Execute the full automated test suite:
 
 ```powershell
-# Run all unit, security, memory, and sandbox tests
+# Run all unit, security, memory, sandbox, integration, and fixture tests (46 tests)
 $env:PYTHONPATH="."
-.\venv\Scripts\python.exe -m pytest backend/tests/ -v
+.\venv\Scripts\python.exe -m pytest backend/tests/ experiments/functional_fixtures/tests/ -v
+
+# Run the live bug evaluation scenarios
+.\venv\Scripts\python.exe -m backend.tests.run_bug_evaluations
+```
 
 # Run the live bug evaluation scenarios
 .\venv\Scripts\python.exe -m backend.tests.run_bug_evaluations

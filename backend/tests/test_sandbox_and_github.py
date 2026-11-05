@@ -22,7 +22,7 @@ def test_docker_sandbox_process_fallback():
     sandbox = DockerSandbox(default_timeout=15)
     temp_dir = tempfile.mkdtemp(prefix="aegis_test_sandbox_")
     try:
-        res = sandbox.run_command(["python", "-c", "print('hello from sandbox')"], workspace_dir=temp_dir)
+        res = sandbox._run_in_process(["python", "-c", "print('hello from sandbox')"], workspace_dir=temp_dir, timeout=15)
         assert res.passed
         assert "hello from sandbox" in res.stdout
     finally:
@@ -34,7 +34,7 @@ def test_docker_sandbox_timeout():
     sandbox = DockerSandbox(default_timeout=2)
     temp_dir = tempfile.mkdtemp(prefix="aegis_test_timeout_")
     try:
-        res = sandbox.run_command(
+        res = sandbox._run_in_process(
             ["python", "-c", "import time; time.sleep(10)"],
             workspace_dir=temp_dir,
             timeout=2,

@@ -3,11 +3,26 @@ name: AegisCI Automated Pipeline
 on:
   push:
     branches:
-      - '**'
+      - 'main'
+      - 'experiment/**'
+      - 'feature/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
   pull_request:
     branches:
-      - '**'
+      - 'main'
+      - 'experiment/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch to run CI on'
+        required: false
+        default: 'main'
 
 jobs:
   test-and-build:
@@ -32,142 +47,115 @@ jobs:
 
       - name: Run Test Suite
         id: run_tests
+        continue-on-error: true
         run: |
-          python -m pytest --color=yes sample-app/tests | tee test-output.log
+          python -m pytest --color=no sample-app/tests | tee test-output.log
+          echo "TEST_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Run Semgrep Security Scan
+        id: semgrep_scan
+        continue-on-error: true
+        run: |
+          python -m pip install semgrep
+          semgrep --config=auto --json --output=semgrep-results.json sample-app/ || true
+          echo "Semgrep scan finished."
 
       - name: Build Container Image
-        if: success()
+        if: env.TEST_EXIT_CODE == '0'
         run: |
           docker build -t sample-app sample-app/
 
-      - name: AegisCI Failure Hook
-        if: failure()
+      - name: Prepare Unified AegisCI Results Payload
+        id: prepare_payload
         env:
-          AEGIS_BACKEND_URL: ${{ secrets.AEGIS_BACKEND_URL || 'http://localhost:8000' }}
           COMMIT_SHA: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          echo "=========================================="
-          echo "🚨 AegisCI CI Failure Hook Triggered"
-          echo "Repository: $REPO"
-          echo "Commit: $COMMIT_SHA"
-          echo "Branch: $BRANCH"
-          echo "Run ID: $RUN_ID"
-          echo "=========================================="
-          
-          # Capture error log snippet
-          LOG_CONTENT=""
+          # Read test logs
+          TEST_LOGS=""
           if [ -f test-output.log ]; then
-            LOG_CONTENT=$(cat test-output.log)
-          else
-            LOG_CONTENT="Test execution failed during CI pipeline."
+            TEST_LOGS=$(cat test-output.log)
           fi
 
-          # Prepare JSON payload for AegisCI backend
-          PAYLOAD=$(jq -n \
+          # Read semgrep JSON
+          SEMGREP_CONTENT="{}"
+          if [ -f semgrep-results.json ]; then
+            SEMGREP_CONTENT=$(cat semgrep-results.json)
+          fi
+
+          TEST_PASSED=true
+          if [ "$TEST_EXIT_CODE" != "0" ]; then
+            TEST_PASSED=false
+          fi
+
+          # Compose unified JSON payload
+          jq -n \
             --arg repo "$REPO" \
             --arg commit_sha "$COMMIT_SHA" \
             --arg branch "$BRANCH" \
             --arg run_id "$RUN_ID" \
-            --arg logs "$LOG_CONTENT" \
-            '{repo: $repo, commit_sha: $commit_sha, branch: $branch, run_id: $run_id, logs: $logs}')
+            --arg event_name "$EVENT_NAME" \
+            --argjson test_passed "$TEST_PASSED" \
+            --argjson test_exit_code "$TEST_EXIT_CODE" \
+            --arg logs "$TEST_LOGS" \
+            --argjson semgrep_json "$SEMGREP_CONTENT" \
+            '{
+              repo: $repo,
+              commit_sha: $commit_sha,
+              branch: $branch,
+              run_id: $run_id,
+              event_name: $event_name,
+              test_passed: $test_passed,
+              test_exit_code: $test_exit_code,
+              logs: $logs,
+              semgrep_json: $semgrep_json,
+              artifacts: ["test-output.log", "semgrep-results.json", "aegis-ci-run.json"]
+            }' > aegis-ci-run.json
 
-          echo "Posting incident to AegisCI backend at $AEGIS_BACKEND_URL/incident..."
-          
-          # Attempt to notify backend if reachable, otherwise log clearly to local runner
-          curl -s -X POST "$AEGIS_BACKEND_URL/incident" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" || echo "Note: AegisCI backend at $AEGIS_BACKEND_URL unreachable from runner; logged failure locally."
+          echo "AegisCI unified payload created:"
+          head -n 25 aegis-ci-run.json
 
-          echo "$PAYLOAD" > aegis-incident-$RUN_ID.json
-
-      - name: Upload Incident Artifact
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: aegis-incident-report
-          path: |
-            test-output.log
-            aegis-incident-*.json
-          retention-days: 7
-
-  semgrep-scan:
-    name: Semgrep Security Scan
-    runs-on: ubuntu-latest
-    # Run on every push; failures are non-blocking but always reported to AegisCI
-    continue-on-error: true
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Semgrep
-        run: pip install semgrep
-
-      - name: Run Semgrep
-        id: semgrep
-        run: |
-          semgrep --config=auto \
-            --json \
-            --output=semgrep-results.json \
-            sample-app/ || true
-          echo "Semgrep scan complete."
-          cat semgrep-results.json | python3 -c "
-          import json, sys
-          d = json.load(sys.stdin)
-          print(f'Findings: {len(d.get(\"results\", []))}')
-          "
-
-      - name: Post Semgrep Findings to AegisCI
+      - name: Dispatch Results to AegisCI Backend
+        if: env.TEST_EXIT_CODE != '0' || hashFiles('semgrep-results.json') != ''
         env:
           AEGIS_BACKEND_URL: ${{ secrets.AEGIS_BACKEND_URL || 'http://localhost:8000' }}
-          COMMIT_SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
+          AEGIS_WEBHOOK_SECRET: ${{ secrets.AEGIS_WEBHOOK_SECRET || '' }}
         run: |
-          if [ ! -f semgrep-results.json ]; then
-            echo "No semgrep results file found. Skipping."
-            exit 0
+          echo "Dispatching CI results to AegisCI at $AEGIS_BACKEND_URL/ci/results..."
+          
+          # Attempt dispatch with optional secret header
+          HTTP_STATUS=$(curl -s -o dispatch_response.json -w "%{http_code}" \
+            -X POST "$AEGIS_BACKEND_URL/ci/results" \
+            -H "Content-Type: application/json" \
+            -H "X-Aegis-Secret: $AEGIS_WEBHOOK_SECRET" \
+            -d @aegis-ci-run.json || echo "000")
+
+          echo "Response HTTP Status: $HTTP_STATUS"
+          if [ -f dispatch_response.json ]; then
+            cat dispatch_response.json
           fi
 
-          FINDINGS=$(python3 -c "
-          import json
-          with open('semgrep-results.json') as f:
-              d = json.load(f)
-          print(len(d.get('results', [])))
-          ")
-
-          echo "Semgrep found $FINDINGS issue(s)."
-
-          if [ "$FINDINGS" -gt "0" ]; then
-            SEMGREP_JSON=$(cat semgrep-results.json)
-            PAYLOAD=$(jq -n \
-              --arg repo "$REPO" \
-              --arg commit_sha "$COMMIT_SHA" \
-              --arg branch "$BRANCH" \
-              --arg run_id "$RUN_ID" \
-              --argjson semgrep_json "$SEMGREP_JSON" \
-              '{repo: $repo, commit_sha: $commit_sha, branch: $branch, run_id: $run_id, semgrep_json: $semgrep_json}')
-
-            echo "Posting security findings to $AEGIS_BACKEND_URL/security-incident..."
-            curl -s -X POST "$AEGIS_BACKEND_URL/security-incident" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" || echo "AegisCI backend unreachable; findings saved as artifact."
-          else
-            echo "No actionable Semgrep findings to report."
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Note: AegisCI backend at $AEGIS_BACKEND_URL unreachable or returned $HTTP_STATUS."
+            echo "Artifacts are preserved in this workflow run for local ingestion."
           fi
 
-      - name: Upload Semgrep Results
+      - name: Upload AegisCI Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-results
-          path: semgrep-results.json
-          retention-days: 7
+          name: aegis-ci-artifacts
+          path: |
+            test-output.log
+            semgrep-results.json
+            aegis-ci-run.json
+          retention-days: 14
+
+      - name: Enforce CI Status
+        run: |
+          if [ "$TEST_EXIT_CODE" != "0" ]; then
+            echo "CI pipeline failed due to failing tests (exit code $TEST_EXIT_CODE)."
+            exit $TEST_EXIT_CODE
+          fi

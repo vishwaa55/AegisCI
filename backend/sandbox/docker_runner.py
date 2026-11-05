@@ -8,6 +8,7 @@ is unavailable or disabled.
 
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -179,7 +180,7 @@ class DockerSandbox:
             )
 
         container = None
-        cmd_str = " ".join(command)
+        cmd_str = shlex.join(command)
 
         try:
             volumes = {
