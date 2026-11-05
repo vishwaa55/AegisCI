@@ -7,7 +7,7 @@ from calculator import add, divide, calculate_discount, process_user_data
 
 
 def test_add():
-    assert add(2, 3) == 5
+    assert add(2, 3) == 999
     assert add(-1, 1) == 0
     assert add(0, 0) == 0
 
