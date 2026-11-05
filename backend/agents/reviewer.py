@@ -155,22 +155,13 @@ def _replace_hunk_in_content(content: str, hunk_lines: List[str]) -> str:
 
 def run_isolated_tests(sandbox_dir: str) -> Tuple[bool, str]:
     """
-    Runs sample-app test suite in isolated directory.
+    Runs sample-app test suite in isolated directory using DockerSandbox
+    (with automatic fallback to isolated process sandbox).
     """
-    python_exe = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "venv", "Scripts", "python.exe"))
-    if not os.path.exists(python_exe):
-        python_exe = "python"
-
-    cmd = [python_exe, "-m", "pytest", "--color=no", "sample-app/tests"]
-    try:
-        res = subprocess.run(cmd, cwd=sandbox_dir, capture_output=True, text=True, timeout=60)
-        output = res.stdout + ("\n" + res.stderr if res.stderr else "")
-        passed = (res.returncode == 0)
-        return passed, output.strip()
-    except subprocess.TimeoutExpired:
-        return False, "Test execution timed out after 60 seconds."
-    except Exception as e:
-        return False, f"Error launching test subprocess: {e}"
+    from backend.sandbox.docker_runner import DockerSandbox
+    sandbox = DockerSandbox()
+    res = sandbox.run_command(["pytest", "--color=no", "sample-app/tests"], workspace_dir=sandbox_dir, timeout=60)
+    return res.passed, res.combined_output
 
 
 def open_draft_pull_request(

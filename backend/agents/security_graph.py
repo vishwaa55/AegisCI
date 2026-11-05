@@ -66,3 +66,4 @@ def create_security_graph():
 
 
 security_graph = create_security_graph()
+

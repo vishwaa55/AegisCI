@@ -196,3 +196,4 @@ class RejectionMemory:
     def count(self) -> int:
         """Return total number of stored rejection entries."""
         return self._collection.count()
+

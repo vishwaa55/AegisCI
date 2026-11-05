@@ -243,3 +243,4 @@ def defender_b_agent(state: AegisAgentState) -> AegisAgentState:
         "defender_b_proposal": proposal,
         "debate_history": debate_history,
     }
+

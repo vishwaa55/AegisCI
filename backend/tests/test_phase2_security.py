@@ -348,3 +348,4 @@ def _make_base_security_state():
 def _patch_llm_for_state(state):
     """No-op — LLM is not called in structural tests."""
     pass
+
