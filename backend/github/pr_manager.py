@@ -120,3 +120,4 @@ def create_remediation_pull_request(
         f"Ready to push to remote when GitHub credentials are configured."
     )
     return local_url, msg
+

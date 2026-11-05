@@ -86,3 +86,4 @@ def test_create_remediation_pull_request_local_fallback():
     )
     assert url is not None
     assert "branch" in notes.lower()
+

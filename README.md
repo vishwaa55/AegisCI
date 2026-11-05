@@ -161,3 +161,4 @@ $env:PYTHONPATH="."
 6. **Bounded Loops**:
    - Functional repair loop is capped at **3 attempts** before human escalation.
    - Security debate loop is capped at **3 rounds** before human escalation.
+
