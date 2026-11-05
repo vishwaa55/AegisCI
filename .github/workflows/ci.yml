@@ -92,3 +92,82 @@ jobs:
             test-output.log
             aegis-incident-*.json
           retention-days: 7
+
+  semgrep-scan:
+    name: Semgrep Security Scan
+    runs-on: ubuntu-latest
+    # Run on every push; failures are non-blocking but always reported to AegisCI
+    continue-on-error: true
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep
+        id: semgrep
+        run: |
+          semgrep --config=auto \
+            --json \
+            --output=semgrep-results.json \
+            sample-app/ || true
+          echo "Semgrep scan complete."
+          cat semgrep-results.json | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          print(f'Findings: {len(d.get(\"results\", []))}')
+          "
+
+      - name: Post Semgrep Findings to AegisCI
+        env:
+          AEGIS_BACKEND_URL: ${{ secrets.AEGIS_BACKEND_URL || 'http://localhost:8000' }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ ! -f semgrep-results.json ]; then
+            echo "No semgrep results file found. Skipping."
+            exit 0
+          fi
+
+          FINDINGS=$(python3 -c "
+          import json
+          with open('semgrep-results.json') as f:
+              d = json.load(f)
+          print(len(d.get('results', [])))
+          ")
+
+          echo "Semgrep found $FINDINGS issue(s)."
+
+          if [ "$FINDINGS" -gt "0" ]; then
+            SEMGREP_JSON=$(cat semgrep-results.json)
+            PAYLOAD=$(jq -n \
+              --arg repo "$REPO" \
+              --arg commit_sha "$COMMIT_SHA" \
+              --arg branch "$BRANCH" \
+              --arg run_id "$RUN_ID" \
+              --argjson semgrep_json "$SEMGREP_JSON" \
+              '{repo: $repo, commit_sha: $commit_sha, branch: $branch, run_id: $run_id, semgrep_json: $semgrep_json}')
+
+            echo "Posting security findings to $AEGIS_BACKEND_URL/security-incident..."
+            curl -s -X POST "$AEGIS_BACKEND_URL/security-incident" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" || echo "AegisCI backend unreachable; findings saved as artifact."
+          else
+            echo "No actionable Semgrep findings to report."
+          fi
+
+      - name: Upload Semgrep Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+          retention-days: 7

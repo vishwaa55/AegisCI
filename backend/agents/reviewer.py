@@ -388,6 +388,24 @@ def reviewer_agent(state: AegisAgentState) -> AegisAgentState:
     # Branch 2: Tests Failed
     logger.warning(f"[{incident_id}] Attempt {current_attempt} failed tests: {test_output[:200]}...")
 
+    # ── Store rejected patch in ChromaDB rejection memory ─────────────────
+    if patch_diff:
+        try:
+            from backend.memory.rejection_memory import RejectionMemory  # noqa: PLC0415
+            mem = RejectionMemory()
+            rejection_reason = test_output[:300] if test_output else "Test suite failed"
+            mem.store_rejected_patch(
+                incident_id=incident_id,
+                attempt=current_attempt,
+                patch_diff=patch_diff,
+                diagnosis=category,
+                evidence=evidence,
+                rejection_reason=rejection_reason,
+                affected_files=state.get("affected_files", []),
+            )
+        except Exception as e:
+            logger.warning(f"[{incident_id}] Could not store rejection memory: {e}")
+
     if current_attempt < max_attempts:
         # Loopback to Fix-Proposer
         return {

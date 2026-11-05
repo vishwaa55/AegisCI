@@ -95,8 +95,9 @@ def clean_diff_markdown(raw_diff: str) -> str:
 def fix_proposer_agent(state: AegisAgentState) -> AegisAgentState:
     """
     Fix-Proposer Agent:
-    Reads current file contents, invokes LLM to generate a minimal unified diff patch,
-    and applies strict guardrail verification against CI tampering and unauthorized edits.
+    Reads current file contents, retrieves rejection-memory context from ChromaDB,
+    invokes LLM to generate a minimal unified diff patch, and applies strict
+    guardrail verification against CI tampering and unauthorized edits.
     """
     incident_id = state.get("incident_id", "unknown")
     category = state.get("diagnosis_category", "unknown")
@@ -106,6 +107,37 @@ def fix_proposer_agent(state: AegisAgentState) -> AegisAgentState:
     previous_test_output = state.get("test_output", "")
 
     logger.info(f"[{incident_id}] Fix-Proposer Agent generating fix (Attempt {current_attempt})...")
+
+    # ── Rejection-Memory RAG: retrieve past failures ──────────────────────
+    rejection_memory_context = ""
+    try:
+        from backend.memory.rejection_memory import RejectionMemory  # noqa: PLC0415
+        mem = RejectionMemory()
+        if mem.count() > 0:
+            similar = mem.retrieve_similar(
+                query_diagnosis=category or "",
+                query_evidence=evidence or "",
+                top_k=3,
+            )
+            if similar:
+                mem_lines = []
+                for entry in similar:
+                    meta = entry.get("metadata", {})
+                    mem_lines.append(
+                        f"- Attempt {meta.get('attempt', '?')} for incident "
+                        f"'{meta.get('incident_id', '?')}': "
+                        f"Rejected because: {meta.get('rejection_reason', '?')} "
+                        f"[distance={entry.get('distance', 0):.3f}]"
+                    )
+                rejection_memory_context = (
+                    "REJECTION MEMORY — the following similar approaches were tried and FAILED.\n"
+                    "Do NOT repeat these strategies:\n" + "\n".join(mem_lines)
+                )
+                logger.info(
+                    f"[{incident_id}] Retrieved {len(similar)} rejection-memory entries."
+                )
+    except Exception as e:
+        logger.warning(f"[{incident_id}] Rejection memory retrieval skipped: {e}")
 
     # Read affected files content from disk
     files_content_map: Dict[str, str] = {}
@@ -145,12 +177,15 @@ def fix_proposer_agent(state: AegisAgentState) -> AegisAgentState:
 
     cleaned_logs = state.get("cleaned_logs", "")
 
+    rejection_section = f"\n{rejection_memory_context}\n" if rejection_memory_context else ""
+
     user_prompt = (
         f"Incident ID: {incident_id}\n"
         f"Diagnosis Category: {category}\n"
         f"Diagnosis Evidence:\n{evidence}\n\n"
         f"CI Failure Logs & Traceback:\n```\n{cleaned_logs}\n```\n\n"
         f"Affected File(s) Contents:\n{files_context}\n"
+        f"{rejection_section}"
         f"{attempt_feedback}\n"
         "Generate the unified diff patch to resolve the failure:"
     )
@@ -172,4 +207,5 @@ def fix_proposer_agent(state: AegisAgentState) -> AegisAgentState:
         "guardrail_passed": guardrail_passed,
         "guardrail_error": guardrail_error,
         "current_attempt": current_attempt,
+        "rejection_memory_context": rejection_memory_context,
     }

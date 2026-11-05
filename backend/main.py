@@ -13,6 +13,7 @@ from backend.database import Base, engine, get_db, SessionLocal
 from backend.models import Incident, KnownFailure
 from backend.agents.graph import aegis_graph
 from backend.agents.state import AegisAgentState
+from backend.security.parser import parse_semgrep_json
 
 # Configure logging
 logging.basicConfig(
@@ -142,15 +143,27 @@ def report_incident(
         "current_patch": None,
         "guardrail_passed": True,
         "guardrail_error": None,
+        "rejection_memory_context": "",
         "current_attempt": 0,
         "max_attempts": 3,
         "patch_history": [],
         "test_passed": False,
         "test_output": "",
+        # Security workflow fields (unused for CI-failure pipeline)
+        "security_findings": [],
+        "active_finding_id": None,
+        "attacker_assessment": None,
+        "defender_a_proposal": None,
+        "defender_b_proposal": None,
+        "debate_history": [],
+        "judge_decision": None,
+        "security_remediation_round": 0,
+        "max_security_rounds": 3,
         "final_outcome": "processing",
         "pr_link": None,
         "pr_branch": None,
         "summary_notes": "",
+        "agent_execution_log": [],
     }
 
     # Launch LangGraph agent workflow asynchronously
@@ -231,3 +244,122 @@ def add_known_failure(payload: KnownFailureCreate, db: Session = Depends(get_db)
     db.commit()
     db.refresh(kf)
     return {"id": kf.id, "signature": kf.signature, "reason": kf.reason}
+
+
+# ---------------------------------------------------------------------------
+# Security / Semgrep Intake Endpoint
+# ---------------------------------------------------------------------------
+
+class SecurityIncidentCreate(BaseModel):
+    repo: str = Field(default="local/AegisCI")
+    commit_sha: str = Field(default="head")
+    branch: str = Field(default="main")
+    run_id: Optional[str] = Field(default=None)
+    semgrep_json: Dict[str, Any] = Field(..., description="Raw Semgrep JSON output dict")
+
+
+def run_security_workflow_background(initial_state: AegisAgentState):
+    """Background worker that runs the security debate LangGraph."""
+    from backend.agents.security_graph import security_graph  # noqa: PLC0415
+    incident_id = initial_state["incident_id"]
+    logger.info(f"[{incident_id}] Starting security debate pipeline...")
+    try:
+        final_state = security_graph.invoke(initial_state)
+        outcome = final_state.get("final_outcome", "unknown")
+        logger.info(f"[{incident_id}] Security pipeline finished: {outcome}")
+    except Exception as e:
+        logger.error(f"[{incident_id}] Security pipeline error: {e}", exc_info=True)
+        db = SessionLocal()
+        try:
+            inc = db.query(Incident).filter(Incident.id == incident_id).first()
+            if inc:
+                inc.final_outcome = "error"
+                inc.notes = f"Security pipeline error: {str(e)}"
+                db.commit()
+        finally:
+            db.close()
+
+
+@app.post("/security-incident", response_model=IncidentResponse)
+def report_security_incident(
+    payload: SecurityIncidentCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Receives Semgrep JSON output, parses findings, records an incident, and
+    launches the security debate workflow asynchronously.
+    """
+    findings = parse_semgrep_json(payload.semgrep_json)
+    if not findings:
+        raise HTTPException(status_code=422, detail="No actionable security findings in Semgrep output.")
+
+    incident_id = f"sec-{uuid.uuid4().hex[:8]}"
+    run_id = payload.run_id or f"run-{uuid.uuid4().hex[:6]}"
+
+    incident_record = Incident(
+        id=incident_id,
+        repo=payload.repo,
+        commit_sha=payload.commit_sha,
+        branch=payload.branch,
+        run_id=run_id,
+        raw_logs=f"Security findings: {len(findings)} from Semgrep",
+        final_outcome="processing",
+    )
+    db.add(incident_record)
+    db.commit()
+
+    # Use first finding as the active one (each finding should ideally be a separate incident)
+    active = findings[0]
+    findings_dicts = [f.model_dump() for f in findings]
+
+    initial_state: AegisAgentState = {
+        "incident_id": incident_id,
+        "repo": payload.repo,
+        "commit_sha": payload.commit_sha,
+        "branch": payload.branch,
+        "run_id": run_id,
+        "raw_logs": "",
+        "cleaned_logs": "",
+        "is_flaky_ignored": False,
+        "flaky_reason": None,
+        "diagnosis_category": "security_finding",
+        "diagnosis_confidence": 0.9,
+        "affected_files": [active.file_path],
+        "evidence": active.message,
+        "current_patch": None,
+        "guardrail_passed": True,
+        "guardrail_error": None,
+        "rejection_memory_context": "",
+        "current_attempt": 0,
+        "max_attempts": 3,
+        "patch_history": [],
+        "test_passed": False,
+        "test_output": "",
+        "security_findings": findings_dicts,
+        "active_finding_id": active.id,
+        "attacker_assessment": None,
+        "defender_a_proposal": None,
+        "defender_b_proposal": None,
+        "debate_history": [],
+        "judge_decision": None,
+        "security_remediation_round": 1,
+        "max_security_rounds": 3,
+        "final_outcome": "processing",
+        "pr_link": None,
+        "pr_branch": None,
+        "summary_notes": "",
+        "agent_execution_log": [],
+    }
+
+    background_tasks.add_task(run_security_workflow_background, initial_state)
+    logger.info(f"[{incident_id}] Security incident registered: {len(findings)} findings.")
+
+    return IncidentResponse(
+        incident_id=incident_id,
+        status="processing",
+        message=f"AegisCI security debate pipeline triggered for {len(findings)} finding(s).",
+        repo=payload.repo,
+        commit_sha=payload.commit_sha,
+        branch=payload.branch,
+    )

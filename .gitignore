@@ -20,6 +20,8 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+.chroma/
+chroma_data/
 
 # Agent temporary execution / isolated sandboxes
 .agent_sandbox/
